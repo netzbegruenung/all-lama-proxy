@@ -8,6 +8,8 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use std::{
     collections::VecDeque,
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::Instant,
@@ -21,6 +23,20 @@ use crate::appstate::{
 };
 use crate::auth::UserRegistry;
 use crate::utils::LockExt;
+
+/// Rendezvous (highest-random-weight) hash of a user against a backend URL.
+///
+/// Keying on `user_id` pins a user to a stable backend so consecutive requests
+/// reuse the same kv cache, while distributing distinct users evenly. Uses
+/// `DefaultHasher::new()` (fixed seed) so weights are reproducible across
+/// process restarts and SIGHUP reloads, and the backend `url` rather than its
+/// list index so the mapping survives backends going on/offline.
+fn rendezvous_weight(user_id: &str, backend_url: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    user_id.hash(&mut hasher);
+    backend_url.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Format duration showing only seconds if < 1 minute, otherwise minutes and seconds
 fn format_duration_short(d: std::time::Duration) -> String {
@@ -625,39 +641,34 @@ fn select_and_prepare_task(state: &Arc<AppState>, current_idx: &mut usize) -> Se
                         .unwrap_or(0)
                 };
 
-                // PHASE 1: Spread to backends with 0 requests for this model
-                let backends_at_zero = eligible
+                // Sticky selection: among backends still under the per-model
+                // concurrency cap, pick the one with the highest rendezvous
+                // weight for this user. This pins a user to a stable backend
+                // (kv-cache reuse) while spreading distinct users across GPUs;
+                // when the preferred backend is capped, the next-ranked one
+                // takes over automatically.
+                let selected_backend_idx = eligible
                     .iter()
-                    .filter(|&&i| get_model_count(i) == 0)
-                    .count();
+                    .copied()
+                    .filter(|&i| get_model_count(i) < max_concurrency)
+                    .max_by(|&a, &b| {
+                        rendezvous_weight(&user_id, &backends[a].url)
+                            .cmp(&rendezvous_weight(&user_id, &backends[b].url))
+                            .then(a.cmp(&b))
+                    });
 
-                let selected_backend_idx = if backends_at_zero > 0 {
-                    // Phase 1: spread to backends with 0 requests for this model
-                    eligible
-                        .iter()
-                        .min_by_key(|&&i| get_model_count(i))
-                        .copied()
-                        .unwrap()
-                } else if eligible
-                    .iter()
-                    .any(|&i| get_model_count(i) < max_concurrency)
-                {
-                    // Phase 2: all backends at 1+, allow concurrency up to max
-                    eligible
-                        .iter()
-                        .filter(|&&i| get_model_count(i) < max_concurrency)
-                        .min_by_key(|&&i| get_model_count(i))
-                        .copied()
-                        .unwrap()
-                } else {
-                    // All backends at max concurrency - wait, do NOT pop the task
-                    if is_debug {
-                        debug!(
-                            "All backends at max concurrency ({}) for model '{}', user {} waiting",
-                            max_concurrency, model, user_id
-                        );
+                let selected_backend_idx = match selected_backend_idx {
+                    Some(i) => i,
+                    None => {
+                        // All backends at max concurrency - wait, do NOT pop the task
+                        if is_debug {
+                            debug!(
+                                "All backends at max concurrency ({}) for model '{}', user {} waiting",
+                                max_concurrency, model, user_id
+                            );
+                        }
+                        return SelectionResult::Wait;
                     }
-                    return SelectionResult::Wait;
                 };
 
                 // NOW pop the task (backend is guaranteed available)
@@ -1010,5 +1021,77 @@ mod tests {
 
         // Test completes without hanging
         assert!(state.backends.lock().lock_unwrap("backends").len() == 1);
+    }
+
+    #[test]
+    fn test_rendezvous_weight_deterministic() {
+        let a = rendezvous_weight("alice", "http://gpu1:11434");
+        let b = rendezvous_weight("alice", "http://gpu1:11434");
+        assert_eq!(a, b);
+        // Different inputs should (almost certainly) differ.
+        assert_ne!(a, rendezvous_weight("bob", "http://gpu1:11434"));
+        assert_ne!(a, rendezvous_weight("alice", "http://gpu2:11434"));
+    }
+
+    // Pick the highest-weight backend for a user, tie-broken by index,
+    // mirroring the selection logic in select_and_prepare_task.
+    fn pick_backend(user: &str, urls: &[&str]) -> usize {
+        urls.iter()
+            .enumerate()
+            .max_by(|(ia, a), (ib, b)| {
+                rendezvous_weight(user, a)
+                    .cmp(&rendezvous_weight(user, b))
+                    .then(ia.cmp(ib))
+            })
+            .map(|(i, _)| i)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_rendezvous_sticky_per_user() {
+        let urls = [
+            "http://gpu1:11434",
+            "http://gpu2:11434",
+            "http://gpu3:11434",
+        ];
+        let first = pick_backend("alice", &urls);
+        // Same user always maps to the same backend.
+        for _ in 0..100 {
+            assert_eq!(pick_backend("alice", &urls), first);
+        }
+    }
+
+    #[test]
+    fn test_rendezvous_spreads_users() {
+        let urls = [
+            "http://gpu1:11434",
+            "http://gpu2:11434",
+            "http://gpu3:11434",
+        ];
+        let mut seen = HashSet::new();
+        for n in 0..200 {
+            seen.insert(pick_backend(&format!("user{}", n), &urls));
+        }
+        // With 200 users over 3 backends, every backend should be used.
+        assert_eq!(seen.len(), urls.len());
+    }
+
+    #[test]
+    fn test_rendezvous_stable_when_unrelated_backend_removed() {
+        let full = [
+            "http://gpu1:11434",
+            "http://gpu2:11434",
+            "http://gpu3:11434",
+        ];
+        // Find a user not pinned to the last backend, then remove that last
+        // backend and confirm the user's pick is unchanged.
+        let user = (0..1000)
+            .map(|n| format!("user{}", n))
+            .find(|u| pick_backend(u, &full) != full.len() - 1)
+            .expect("expected some user not pinned to the last backend");
+
+        let pick_full = pick_backend(&user, &full);
+        let reduced = &full[..full.len() - 1];
+        assert_eq!(pick_backend(&user, reduced), pick_full);
     }
 }
