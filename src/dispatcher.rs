@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::appstate::{
     AppState, CachedTags, ModelConfig, OpenAIModel, OpenAIModelsList, ResponsePart, Task,
+    model_names_match,
 };
 use crate::auth::UserRegistry;
 use crate::utils::LockExt;
@@ -141,6 +142,9 @@ const MODEL_PATHS: &[&str] = &[
 /// If the model is an alias, it's replaced with the real name in the body.
 /// Returns `None` for non-model endpoints or when the field is absent.
 /// Returns `Some(model_name)` even if not in config (will be 503'd later).
+///
+/// The returned name is the exact spelling from models.yaml, so it can be used
+/// as-is for backend matching and per-model bookkeeping.
 fn extract_and_resolve_model(
     body: &mut Bytes,
     path: &str,
@@ -174,7 +178,7 @@ fn extract_and_resolve_model(
             if debug_enabled {
                 debug!("Model {} not found in config", requested_model);
             }
-            return Some(normalize_model_tag(&requested_model));
+            return Some(requested_model);
         }
     };
 
@@ -187,7 +191,7 @@ fn extract_and_resolve_model(
         }
     }
 
-    Some(normalize_model_tag(&real_model))
+    Some(real_model)
 }
 
 /// Peek at the model name from a request body without modifying it.
@@ -196,15 +200,6 @@ fn peek_model_from_body(body: &Bytes) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let requested_model = v.get("model")?.as_str()?.to_string();
     Some(requested_model)
-}
-
-/// Append `:latest` if the model name has no explicit tag.
-fn normalize_model_tag(name: &str) -> String {
-    if name.contains(':') {
-        name.to_string()
-    } else {
-        format!("{}:latest", name)
-    }
 }
 
 /// Parse Unix timestamp from Ollama modified_at format or return current time
@@ -256,7 +251,7 @@ fn find_model_by_name(state: &AppState, requested_model: &str) -> Option<OpenAIM
     let model_info = cached_tags.as_ref().and_then(|tags| {
         tags.models
             .iter()
-            .find(|m| m.name == requested_model || m.name == format!("{}:latest", requested_model))
+            .find(|m| model_names_match(&m.name, requested_model))
     });
 
     if let Some(model) = model_info {
@@ -589,19 +584,13 @@ fn select_and_prepare_task(state: &Arc<AppState>, current_idx: &mut usize) -> Se
     // Peek at the original requested model name
     let requested_model = peek_model_from_body(&task_body);
 
-    // Resolve alias to get the real model name (for routing decisions)
+    // Resolve to the exact model name as spelled in models.yaml (for routing
+    // decisions). Matching tolerates an implicit `:latest` tag on either side,
+    // but the routing key must keep the config spelling because that is what
+    // `BackendStatus::configured_models` and `model_status` are keyed by.
     let resolved_model = requested_model
-        .clone()
-        .and_then(|model| {
-            if let Some(resolved) = config.resolve_alias(&model) {
-                Some(resolved)
-            } else if config.get_model(&model).is_some() {
-                Some(normalize_model_tag(&model))
-            } else {
-                None
-            }
-        })
-        .map(|m| normalize_model_tag(&m));
+        .as_deref()
+        .and_then(|model| config.resolve_alias(model));
 
     drop(config);
 
@@ -615,6 +604,27 @@ fn select_and_prepare_task(state: &Arc<AppState>, current_idx: &mut usize) -> Se
                 .collect();
 
             if eligible.is_empty() {
+                // Nothing online can serve the model right now. A backend that is
+                // merely offline or temporarily missing the model will recover, so
+                // wait without popping. But if no backend is configured for the
+                // model at all, waiting can never succeed and the task would block
+                // the head of this user's queue forever - fail it instead.
+                let configured_anywhere = backends
+                    .iter()
+                    .any(|b| b.configured_models.iter().any(|m| m == &model));
+
+                if !configured_anywhere {
+                    let task = match queues.get_mut(&user_id).and_then(|q| q.pop_front()) {
+                        Some(t) => t,
+                        None => {
+                            warn!("User {} disappeared from queues", user_id);
+                            return SelectionResult::Wait;
+                        }
+                    };
+                    *counter += 1;
+                    return SelectionResult::ModelNotFound(task, model);
+                }
+
                 // No eligible backend - wait, do NOT pop the task
                 if is_debug {
                     debug!(
@@ -691,12 +701,12 @@ fn select_and_prepare_task(state: &Arc<AppState>, current_idx: &mut usize) -> Se
                     task.resolved_model = Some(resolved.clone());
 
                     // Log alias rewrite if different from requested
-                    let orig_normalized = requested_model
+                    // (a tag-only difference like `foo` -> `foo:latest` is not a rewrite)
+                    let is_alias_rewrite = requested_model
                         .as_ref()
-                        .map(|m| normalize_model_tag(m))
-                        .or_else(|| Some(resolved.clone()));
+                        .is_some_and(|m| !model_names_match(m, resolved));
 
-                    if orig_normalized.as_ref() != Some(resolved) {
+                    if is_alias_rewrite {
                         info!(
                             "Mapped requested model {} to {} for user {}",
                             requested_model.as_deref().unwrap_or("unknown"),
@@ -1021,6 +1031,134 @@ mod tests {
 
         // Test completes without hanging
         assert!(state.backends.lock().lock_unwrap("backends").len() == 1);
+    }
+
+    fn parsed_model(name: &str, aliases: &[&str]) -> crate::appstate::ParsedModel {
+        crate::appstate::ParsedModel {
+            name: name.to_string(),
+            public_name: None,
+            backends: vec!["http://localhost:11434".to_string()],
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            max_concurrent_requests: 1,
+            keep_alive: true,
+        }
+    }
+
+    fn resolve(config: &ModelConfig, requested: &str) -> (Option<String>, String) {
+        let mut body = Bytes::from(format!(r#"{{"model":"{}"}}"#, requested));
+        let resolved = extract_and_resolve_model(&mut body, "/api/chat", config, false);
+        let sent_model: String = serde_json::from_slice::<serde_json::Value>(&body)
+            .unwrap()
+            .get("model")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        (resolved, sent_model)
+    }
+
+    fn test_backend(configured: &[&str]) -> BackendStatus {
+        let mut backend = BackendStatus::new("http://localhost:11434".to_string());
+        backend.configured_models = configured.iter().map(|s| s.to_string()).collect();
+        backend
+    }
+
+    #[test]
+    fn test_untagged_config_model_is_routable() {
+        // Regression: an untagged models.yaml name must not be rewritten to
+        // `:latest`, otherwise it never matches configured_models.
+        let config = ModelConfig {
+            models: vec![parsed_model("muse-glimmer", &[])],
+        };
+        let backend = test_backend(&["muse-glimmer"]);
+
+        let (resolved, sent) = resolve(&config, "muse-glimmer");
+        assert_eq!(resolved.as_deref(), Some("muse-glimmer"));
+        assert_eq!(sent, "muse-glimmer");
+        assert!(backend.can_serve_model(&resolved.unwrap()));
+    }
+
+    #[test]
+    fn test_explicit_latest_resolves_to_config_spelling() {
+        let config = ModelConfig {
+            models: vec![parsed_model("muse-glimmer", &[])],
+        };
+        let backend = test_backend(&["muse-glimmer"]);
+
+        let (resolved, sent) = resolve(&config, "muse-glimmer:latest");
+        assert_eq!(resolved.as_deref(), Some("muse-glimmer"));
+        assert_eq!(sent, "muse-glimmer", "body must carry the config spelling");
+        assert!(backend.can_serve_model(&resolved.unwrap()));
+    }
+
+    #[test]
+    fn test_tagged_config_model_keeps_its_tag() {
+        let config = ModelConfig {
+            models: vec![parsed_model("qwen3:35b", &["qwen3"])],
+        };
+        let backend = test_backend(&["qwen3:35b"]);
+
+        let (resolved, sent) = resolve(&config, "qwen3:35b");
+        assert_eq!(resolved.as_deref(), Some("qwen3:35b"));
+        assert_eq!(sent, "qwen3:35b");
+        assert!(backend.can_serve_model(&resolved.unwrap()));
+
+        // Reachable via the explicit alias, which rewrites the body.
+        let (resolved, sent) = resolve(&config, "qwen3");
+        assert_eq!(resolved.as_deref(), Some("qwen3:35b"));
+        assert_eq!(sent, "qwen3:35b");
+    }
+
+    #[test]
+    fn test_bare_name_does_not_match_unrelated_tag() {
+        // `foo` means `foo:latest`, never `foo:7b`.
+        let config = ModelConfig {
+            models: vec![parsed_model("qwen3:35b", &[])],
+        };
+        let (resolved, sent) = resolve(&config, "qwen3");
+        assert_eq!(resolved.as_deref(), Some("qwen3"));
+        assert_eq!(sent, "qwen3", "unknown model body must stay untouched");
+    }
+
+    #[tokio::test]
+    async fn test_model_without_any_backend_is_failed_not_queued() {
+        // A task that no backend is configured for must be popped and 503'd,
+        // otherwise it blocks the head of the user's queue forever.
+        let state = create_test_state();
+        *state.model_config.write().unwrap() = ModelConfig {
+            models: vec![parsed_model("ghost:1b", &[])],
+        };
+        state
+            .backends
+            .lock()
+            .lock_unwrap("backends")
+            .push(test_backend(&["other:1b"]));
+
+        let (tx, _rx) = mpsc::channel(32);
+        state
+            .queues
+            .lock()
+            .lock_unwrap("queues")
+            .entry("alice".to_string())
+            .or_insert_with(VecDeque::new)
+            .push_back(Task {
+                method: Method::POST,
+                path: "/api/chat".to_string(),
+                headers: HeaderMap::new(),
+                body: Bytes::from(r#"{"model":"ghost:1b"}"#),
+                responder: tx,
+                resolved_model: None,
+            });
+
+        let mut idx = 0;
+        match select_and_prepare_task(&state, &mut idx) {
+            SelectionResult::ModelNotFound(_, model) => assert_eq!(model, "ghost:1b"),
+            _ => panic!("expected ModelNotFound for a model without any backend"),
+        }
+        assert!(
+            state.queues.lock().lock_unwrap("queues")["alice"].is_empty(),
+            "task must be removed from the queue"
+        );
     }
 
     #[test]

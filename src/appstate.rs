@@ -245,6 +245,21 @@ fn default_max_concurrent_requests() -> usize {
     1
 }
 
+/// Append `:latest` if the model name has no explicit tag.
+pub fn normalize_model_tag(name: &str) -> String {
+    if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("{}:latest", name)
+    }
+}
+
+/// Compare two model names treating a missing tag as `:latest`,
+/// so `foo` and `foo:latest` refer to the same model.
+pub fn model_names_match(a: &str, b: &str) -> bool {
+    a == b || normalize_model_tag(a) == normalize_model_tag(b)
+}
+
 /// Runtime backend status
 #[derive(Clone)]
 pub struct BackendStatus {
@@ -310,11 +325,18 @@ impl ModelConfig {
         Ok(config)
     }
 
-    /// Resolve alias to real model name, returns None if not found
+    /// Resolve alias to the real model name as spelled in the config,
+    /// returns None if not found. Matching ignores an implicit `:latest` tag on
+    /// either side, but the returned name is always the exact config spelling so
+    /// it matches `BackendStatus::configured_models`.
     pub fn resolve_alias(&self, model_name: &str) -> Option<String> {
         // Check explicit aliases first
         for model in &self.models {
-            if model.aliases.contains(&model_name.to_string()) {
+            if model
+                .aliases
+                .iter()
+                .any(|alias| model_names_match(alias, model_name))
+            {
                 return Some(model.name.clone());
             }
         }
@@ -322,7 +344,7 @@ impl ModelConfig {
         // Check public_name as implicit alias
         for model in &self.models {
             if let Some(ref public_name) = model.public_name {
-                if public_name == model_name {
+                if model_names_match(public_name, model_name) {
                     return Some(model.name.clone());
                 }
             }
@@ -330,7 +352,7 @@ impl ModelConfig {
 
         // Check if it's already a real model name
         for model in &self.models {
-            if model.name == model_name {
+            if model_names_match(&model.name, model_name) {
                 return Some(model.name.clone());
             }
         }
@@ -341,9 +363,13 @@ impl ModelConfig {
     /// Get ParsedModel by name or alias (including public_name)
     pub fn get_model(&self, model_name: &str) -> Option<&ParsedModel> {
         self.models.iter().find(|m| {
-            m.name == model_name
-                || m.aliases.contains(&model_name.to_string())
-                || m.public_name.as_ref().map_or(false, |pn| pn == model_name)
+            model_names_match(&m.name, model_name)
+                || m.aliases
+                    .iter()
+                    .any(|alias| model_names_match(alias, model_name))
+                || m.public_name
+                    .as_ref()
+                    .is_some_and(|pn| model_names_match(pn, model_name))
         })
     }
 
