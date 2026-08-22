@@ -73,6 +73,14 @@ Generate token hash: `echo -n "token" | sha256sum`
 
 Example systemd files in `examples/all-llama-proxy.service` and `examples/all-llama-proxy.socket`.
 
+The dashboard socket is created with mode `0o660` (owner + group only) so that no arbitrary local user can connect and issue privileged `DashboardCmd` (BlockUser / BlockIp / ToggleVip) (dashboard_server.rs:60-83). This means the TUI, and any client of the socket, must be able to access the socket via its owning user or group:
+
+- Run the TUI as the proxy's user (the example unit uses `www-data` for both `User` and `Group`): `sudo -u www-data all-llama-tui`.
+- Or add the operator's user to the proxy's group (e.g. `sudo usermod -aG www-data <operator>`, then re-login) so the group `0o660` permission grants access.
+- Under systemd socket activation, `SocketUser`/`SocketGroup` in the `.socket` file control this; keep them matching the proxy's group.
+
+Note: the socket permission requirement is a deployment prerequisite, not enforced in code. A user who is neither the socket owner nor in its group gets `EACCES` on connect.
+
 ## Framework/toolchain notes
 
 - **Edition 2024** (Cargo.toml:4)

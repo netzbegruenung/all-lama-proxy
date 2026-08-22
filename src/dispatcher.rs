@@ -309,7 +309,43 @@ fn dispatch_task(args: DispatchTaskArgs) {
         state,
         client,
     } = args;
-    let url = format!("{}{}", backend_url, task.path);
+    let url = match backend_request_url(&backend_url, &task.path) {
+        Ok(u) => u.to_string(),
+        Err(e) => {
+            warn!(
+                "Invalid backend URL: base={} path={} ({}) (user {})",
+                backend_url, task.path, e, user_id
+            );
+
+            // select_and_prepare_task already reserved a slot on this backend.
+            // This is the one exit from dispatch_task that never reaches the
+            // spawned task's cleanup, so release the reservation here —
+            // otherwise active_requests stays permanently inflated, and it
+            // drives both least-connections selection and the concurrency cap.
+            {
+                let mut backends = state.backends.lock().lock_unwrap("backends");
+                let backend = &mut backends[backend_idx];
+                backend.active_requests = backend.active_requests.saturating_sub(1);
+                if let Some(model) = task.resolved_model.as_ref() {
+                    let count = backend.active_models.entry(model.clone()).or_insert(0);
+                    *count = count.saturating_sub(1);
+                }
+            }
+            state.backend_freed.notify_one();
+
+            // Report the actual reason rather than dropping the responder and
+            // leaving the client on the generic worker-failure path.
+            // dispatch_task is sync, so use try_send; the channel is empty at
+            // this point (nothing has been sent for this task yet).
+            let _ = task.responder.try_send(ResponsePart::Failed(format!(
+                "invalid backend URL {}: {}",
+                backend_url, e
+            )));
+            let mut dropped = state.dropped_counts.lock().lock_unwrap("dropped_counts");
+            *dropped.entry(user_id).or_insert(0) += 1;
+            return;
+        }
+    };
 
     if state.debug {
         debug!(
@@ -478,6 +514,25 @@ fn dispatch_task(args: DispatchTaskArgs) {
         }
         state.backend_freed.notify_one();
     });
+}
+
+/// Compose the outbound URL for a request `path` (e.g. `/api/chat`) against a
+/// backend base URL.
+///
+/// `Url::join` on its own is not enough: per RFC 3986 an absolute reference
+/// like `/api/chat` *replaces* the base path, so a backend configured under a
+/// subpath (`http://host/ollama`, e.g. Ollama behind a reverse proxy) would
+/// silently lose its prefix and every request would 404. Appending `path` as a
+/// relative reference to a base whose path ends in `/` preserves the prefix,
+/// while still avoiding the double-slash and escaping pitfalls of `format!`.
+fn backend_request_url(base: &str, path: &str) -> Result<reqwest::Url, String> {
+    let mut base = reqwest::Url::parse(base).map_err(|e| e.to_string())?;
+    if !base.path().ends_with('/') {
+        let with_slash = format!("{}/", base.path());
+        base.set_path(&with_slash);
+    }
+    base.join(path.trim_start_matches('/'))
+        .map_err(|e| e.to_string())
 }
 
 async fn handle_model_not_found(task: Task, model_name: String) {
@@ -876,7 +931,9 @@ pub async fn proxy_handler(
             let stream = ReceiverStream::new(rx).map(|part| match part {
                 ResponsePart::Chunk(chunk) => Ok(chunk),
                 ResponsePart::Error(e) => Err(e),
-                ResponsePart::ModelNotFound(_) | ResponsePart::Status(_, _) => Ok(Bytes::new()),
+                ResponsePart::Failed(_)
+                | ResponsePart::ModelNotFound(_)
+                | ResponsePart::Status(_, _) => Ok(Bytes::new()),
             });
 
             let mut res = Body::from_stream(stream).into_response();
@@ -885,12 +942,19 @@ pub async fn proxy_handler(
             res
         }
         Some(ResponsePart::Error(e)) => {
-            error!("Backend error for user {}: {}", user_id, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Backend error: {}", e),
-            )
-                .into_response()
+            // Log the full detail (including the upstream URL, which is
+            // sensitive) server-side only. Returning `e` to the client would
+            // leak backend host/IP/port — the client only gets a generic
+            // error. `502 Bad Gateway` is the correct status: the backend is
+            // the upstream server that failed for *us*.
+            warn!("Backend request failed for user {}: {e}", user_id);
+            (StatusCode::BAD_GATEWAY, "Backend request failed").into_response()
+        }
+        Some(ResponsePart::Failed(msg)) => {
+            // Same rationale as above: the reason names the backend URL, so it
+            // stays server-side and the client gets a generic 502.
+            warn!("Dispatch failed for user {}: {msg}", user_id);
+            (StatusCode::BAD_GATEWAY, "Backend request failed").into_response()
         }
         _ => {
             error!("Worker failed to respond for user {}", user_id);
@@ -1231,5 +1295,31 @@ mod tests {
         let pick_full = pick_backend(&user, &full);
         let reduced = &full[..full.len() - 1];
         assert_eq!(pick_backend(&user, reduced), pick_full);
+    }
+
+    #[test]
+    fn test_backend_request_url_preserves_base_path() {
+        // Regression: a bare `Url::join("/api/chat")` on a base with a path
+        // prefix would replace the prefix — the whole point of this helper is
+        // to not do that.
+        let base = backend_request_url("http://host:11434/ollama", "/api/chat").unwrap();
+        assert_eq!(base.as_str(), "http://host:11434/ollama/api/chat");
+
+        let base = backend_request_url("http://host:11434", "/api/chat").unwrap();
+        assert_eq!(base.as_str(), "http://host:11434/api/chat");
+
+        // Already-trailing-slash base is not doubled.
+        let base = backend_request_url("http://host:11434/", "/api/chat").unwrap();
+        assert_eq!(base.as_str(), "http://host:11434/api/chat");
+
+        // Multi-segment prefix and path both work.
+        let base = backend_request_url("http://host:11434/a/b", "/c/d").unwrap();
+        assert_eq!(base.as_str(), "http://host:11434/a/b/c/d");
+    }
+
+    #[test]
+    fn test_backend_request_url_rejects_invalid() {
+        assert!(backend_request_url("not a url", "/api/chat").is_err());
+        assert!(backend_request_url("host:11434", "/api/chat").is_err());
     }
 }

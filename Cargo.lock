@@ -23,6 +23,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "humantime",
+ "libc",
  "listenfd",
  "ratatui",
  "reqwest",

@@ -53,6 +53,14 @@ pub enum DashboardCmd {
 // Wire helpers
 // ───────────────
 
+/// Maximum length of a single wire message's payload, excluding the 4-byte
+/// length header.
+///
+/// A peer must not advertise a length larger than this. Capping the length
+/// prevents an unauthenticated dashboard socket peer from driving unbounded
+/// memory growth in the read buffer (length-prefix DoS).
+pub const MAX_MESSAGE_LEN: usize = 4 * 1024 * 1024;
+
 pub fn encode<T: Serialize + std::fmt::Debug>(payload: &T) -> std::io::Result<Vec<u8>> {
     let config = standard();
     let body = encode_to_vec(payload, config).map_err(|e| {
@@ -62,6 +70,20 @@ pub fn encode<T: Serialize + std::fmt::Debug>(payload: &T) -> std::io::Result<Ve
         )
     })?;
 
+    // Refuse to emit a message no peer could decode: `decode` rejects anything
+    // above the cap, so writing it would strand the reader waiting for a
+    // message that never completes.
+    if body.len() > MAX_MESSAGE_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "encoded message of {} bytes exceeds the {}-byte wire limit",
+                body.len(),
+                MAX_MESSAGE_LEN
+            ),
+        ));
+    }
+
     let len = (body.len() as u32).to_be_bytes();
     let mut msg = Vec::with_capacity(body.len() + 4);
     msg.extend_from_slice(&len);
@@ -69,19 +91,33 @@ pub fn encode<T: Serialize + std::fmt::Debug>(payload: &T) -> std::io::Result<Ve
     Ok(msg)
 }
 
-/// Returns the message body length from the 4-byte big-endian prefix, or None if not enough bytes.
-fn prefix_len(buf: &[u8]) -> Option<usize> {
+/// Returns the message body length from the 4-byte big-endian prefix, or
+/// `Ok(None)` if the header itself is not fully buffered yet.
+///
+/// An advertised length above [`MAX_MESSAGE_LEN`] is an error, reported here on
+/// sight: the caller can drop the peer as soon as the header arrives instead of
+/// first buffering the oversized payload to discover it is too large.
+fn prefix_len(buf: &[u8]) -> std::io::Result<Option<usize>> {
     if buf.len() < 4 {
-        return None;
+        return Ok(None);
     }
     let len_bytes: [u8; 4] = [buf[0], buf[1], buf[2], buf[3]];
-    Some(u32::from_be_bytes(len_bytes) as usize)
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    if len > MAX_MESSAGE_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "peer advertised a {}-byte message, exceeding the {}-byte limit",
+                len, MAX_MESSAGE_LEN
+            ),
+        ));
+    }
+    Ok(Some(len))
 }
 
 pub fn decode<T: for<'a> Deserialize<'a>>(buf: &[u8]) -> std::io::Result<Option<T>> {
-    let len = match prefix_len(buf) {
-        Some(l) => l,
-        None => return Ok(None),
+    let Some(len) = prefix_len(buf)? else {
+        return Ok(None);
     };
     if buf.len() < 4 + len {
         return Ok(None);
@@ -98,12 +134,18 @@ pub fn decode<T: for<'a> Deserialize<'a>>(buf: &[u8]) -> std::io::Result<Option<
         })
 }
 
-/// Returns how many bytes to consume after successfully decoding, or None if not a valid message.
-pub fn consumed_len(buf: &[u8]) -> Option<usize> {
-    let len = prefix_len(buf)?;
+/// Returns how many bytes a complete message occupies (header + payload), or
+/// `Ok(None)` if it is not fully buffered yet.
+///
+/// Returns `Err` if the header advertises a payload above [`MAX_MESSAGE_LEN`];
+/// callers should treat that as grounds for dropping the peer.
+pub fn consumed_len(buf: &[u8]) -> std::io::Result<Option<usize>> {
+    let Some(len) = prefix_len(buf)? else {
+        return Ok(None);
+    };
     if buf.len() >= 4 + len {
-        Some(4 + len)
+        Ok(Some(4 + len))
     } else {
-        None
+        Ok(None)
     }
 }

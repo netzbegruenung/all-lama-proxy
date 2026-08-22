@@ -823,9 +823,15 @@ async fn run_reader(
             }
             match decode::<DashboardSnapshot>(&read_buf) {
                 Ok(Some(snap)) => {
-                    let consumed = consumed_len(&read_buf).unwrap();
-                    read_buf.drain(..consumed);
-                    let _ = tx.send(snap).await;
+                    // decode() succeeded, so the header is in bounds and the
+                    // payload is fully buffered.
+                    match consumed_len(&read_buf)? {
+                        Some(consumed) => {
+                            read_buf.drain(..consumed);
+                            let _ = tx.send(snap).await;
+                        }
+                        None => break,
+                    }
                 }
                 Ok(None) => break,
                 Err(_) => {

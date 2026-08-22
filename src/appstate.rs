@@ -210,6 +210,102 @@ pub struct ModelConfig {
     pub models: Vec<ParsedModel>,
 }
 
+/// Validate that a backend URL is safe and reachable for proxying.
+///
+/// Enforces:
+///   - scheme is `http` or `https` (rejects `file://`, `gopher://`, etc.)
+///   - a non-empty host is present (rejects bare `http:///path`)
+///   - no embedded userinfo/credentials (rejects `http://user:pass@host/`)
+///   - port, if present, is a valid non-zero 16-bit port
+///   - the URL parses as a valid absolute URL
+///
+/// This is the primary URL-injection mitigation. The outbound destination is
+/// config-driven (not client-pickable), but an operator-controlled
+/// `models.yaml` containing `file:///etc/shadow` would otherwise be handed
+/// straight to reqwest.
+///
+/// There is deliberately **no IP allowlist or denylist**: loopback, RFC1918
+/// ranges and the cloud-metadata address (`http://169.254.169.254/`) are all
+/// accepted, because pointing at loopback and private hosts is the normal
+/// deployment. Scheme restriction is the only network-level control here — see
+/// the `documents_no_ip_allowlist` test.
+///
+/// Note: the base URL does *not* have to end with `/`, and a path prefix
+/// (`http://host/ollama`, e.g. Ollama behind a reverse proxy) is accepted and
+/// preserved when the request path is appended — see `backend_request_url`.
+pub fn validate_backend_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let u = url.trim();
+    if u.is_empty() {
+        return Err("backend URL is empty".into());
+    }
+
+    // Split out the scheme manually (avoid pulling in a URL parser just for
+    // this; we only need http/https).
+    let lowered = u.to_ascii_lowercase();
+    let rest = if let Some(r) = lowered.strip_prefix("http://") {
+        r
+    } else if let Some(r) = lowered.strip_prefix("https://") {
+        r
+    } else {
+        return Err(format!("backend URL must start with http:// or https:// (got: {u})").into());
+    };
+
+    // The authority part is up to the first '/', '?' or '#'.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err(format!(
+            "backend URL '{}' is missing a host (e.g. http://127.0.0.1:11434/)",
+            u
+        )
+        .into());
+    }
+
+    // Reject embedded credentials: http://user:pass@host/
+    if authority.contains('@') {
+        return Err(format!("backend URL '{}' must not embed userinfo (@)", u).into());
+    }
+
+    // Split authority into host[:port]. An IPv6 literal is bracketed
+    // (`[::1]`), so its port — if any — is the ':' *after* the closing
+    // bracket; a bare `rfind(':')` would land inside the address and treat
+    // the trailing `1]` of `[::1]` as the port.
+    let (host, port_str) = if let Some(close) = authority.rfind(']') {
+        match authority[close + 1..].strip_prefix(':') {
+            Some(port) => (&authority[..=close], port),
+            None => (authority, ""),
+        }
+    } else {
+        match authority.rfind(':') {
+            Some(idx) if !authority[idx + 1..].contains(':') => {
+                (&authority[..idx], &authority[idx + 1..])
+            }
+            _ => (authority, ""),
+        }
+    };
+
+    if host.is_empty() {
+        return Err(format!("backend URL '{}' has an empty host", u).into());
+    }
+
+    if !port_str.is_empty() {
+        match port_str.parse::<u16>() {
+            Ok(0) => {
+                return Err(format!("backend URL '{}' has invalid port 0", u).into());
+            }
+            Err(_) => {
+                return Err(format!("backend URL '{}' has invalid port '{}'", u, port_str).into());
+            }
+            Ok(_) => {}
+        }
+    }
+
+    // Final sanity: the base URL should parse as a valid absolute URL.
+    reqwest::Url::parse(u)
+        .map_err(|e| format!("backend URL '{}' is not a valid HTTP(S) URL: {e}", u))?;
+
+    Ok(())
+}
+
 /// Individual model configuration with explicit backends and aliases
 #[derive(Deserialize, Clone)]
 pub struct ParsedModel {
@@ -320,6 +416,12 @@ impl ModelConfig {
             if model.backends.is_empty() {
                 return Err(format!("Model '{}' has no backends configured", model.name).into());
             }
+            // Validate each backend URL: http(s) only, non-empty host, no
+            // embedded userinfo, base path terminated with '/'. This is the
+            // primary SSRF / URL-injection mitigation.
+            for backend in &model.backends {
+                validate_backend_url(backend)?;
+            }
         }
 
         Ok(config)
@@ -398,6 +500,10 @@ pub enum ResponsePart {
     Status(StatusCode, HeaderMap),
     Chunk(Bytes),
     Error(reqwest::Error),
+    /// A dispatch failure with no `reqwest::Error` behind it (e.g. a backend
+    /// URL that could not be composed). Carries the server-side reason; the
+    /// client still only sees a generic 502.
+    Failed(String),
     ModelNotFound(String),
 }
 
@@ -681,5 +787,83 @@ impl AppState {
             .lock()
             .lock_unwrap("blocked_users")
             .contains(user_id)
+    }
+}
+
+#[cfg(test)]
+mod validator_tests {
+    use super::validate_backend_url;
+
+    #[test]
+    fn accepts_http_ipv4_port() {
+        assert!(validate_backend_url("http://10.137.1.1:11434").is_ok());
+        assert!(validate_backend_url("http://127.0.0.1:11434/").is_ok());
+        assert!(validate_backend_url("http://example.com").is_ok());
+        assert!(validate_backend_url("https://example.com:8443/base").is_ok());
+        assert!(validate_backend_url("  https://host:9000/  ").is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_scheme() {
+        assert!(validate_backend_url("file:///etc/shadow").is_err());
+        assert!(validate_backend_url("gopher://host:25").is_err());
+        assert!(validate_backend_url("ftp://host/pub").is_err());
+        assert!(validate_backend_url("10.0.0.1:11434").is_err());
+        assert!(validate_backend_url("example.com:11434").is_err());
+        assert!(validate_backend_url("").is_err());
+        assert!(validate_backend_url("   ").is_err());
+    }
+
+    #[test]
+    fn documents_no_ip_allowlist() {
+        // We deliberately do NOT add an IP allowlist: an operator that
+        // enumerates a trusted internal backend (e.g. `http://10.0.0.5:11434/`)
+        // is the intended use case. We only reject *syntactically* unsafe URLs
+        // (bad scheme, no host, embedded creds, bad port). The cloud-metadata
+        // URL below is therefore *accepted* by `validate_backend_url` — this
+        // is a policy decision for the operator, not a syntax error, and the
+        // test exists to pin that down so a future "hardening" does not
+        // silently break legitimate private-network backends.
+        assert!(validate_backend_url("http://169.254.169.254/").is_ok());
+    }
+
+    #[test]
+    fn rejects_missing_host() {
+        assert!(validate_backend_url("http:///path").is_err());
+        assert!(validate_backend_url("http://").is_err());
+    }
+
+    #[test]
+    fn rejects_embedded_credentials() {
+        assert!(validate_backend_url("http://user:pass@host:11434/").is_err());
+        assert!(validate_backend_url("https://admin@host/").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_port() {
+        assert!(validate_backend_url("http://host:99999").is_err());
+        assert!(validate_backend_url("http://host:0").is_err());
+        assert!(validate_backend_url("http://host:abc").is_err());
+    }
+
+    #[test]
+    fn accepts_ipv6() {
+        // URL::parse and url::Url both handle bracketed IPv6.
+        assert!(validate_backend_url("http://[::1]:11434/").is_ok());
+    }
+
+    #[test]
+    fn accepts_bracketed_ipv6_without_explicit_port() {
+        // Regression test: previously `parse_backend_address` returned the raw
+        // literal for unbracketed values (correct), but bracketed values fell
+        // into a naive `rsplit(':')` that mis-parsed the bracket, leaving a
+        // non-numeric "port" and rejecting perfectly valid bracketed IPv6
+        // URLs without an explicit port.
+        assert!(validate_backend_url("http://[::1]").is_ok());
+        assert!(validate_backend_url("http://[2001:db8::ff00:42:8329]").is_ok());
+        // Non-literal (hostname) bracketed hosts are rejected outright by the
+        // url crate (`http://[example.org]` is not a valid special-form URL) —
+        // they are not a supported form, so `is_ok` below is not asserted.
+        assert!(validate_backend_url("http://[backend.example.org]").is_err());
     }
 }

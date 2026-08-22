@@ -2,6 +2,7 @@ use crate::appstate::AppState;
 use crate::protocol::{BackendSnapshot, DashboardCmd, DashboardSnapshot, consumed_len, decode};
 use crate::utils::LockExt;
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,9 +42,45 @@ impl DashboardServer {
     pub async fn serve(self, state: Arc<AppState>) -> std::io::Result<()> {
         let listener = match self.serve_mode {
             ServeMode::File(socket_path) => {
+                // Remove a stale socket left behind by a previous process so
+                // the bind below does not fail, and the file below is freshly
+                // created (allowing us to control its permissions).
                 let _ = std::fs::remove_file(&socket_path);
-                let listener = tokio::net::UnixListener::bind(&socket_path)?;
+
+                // Create the socket already restricted to owner + group. A Unix
+                // domain socket takes its mode from the process umask, so with a
+                // typical 0o022 umask a plain bind() yields a world-connectable
+                // socket, and chmod'ing afterwards only shortens the window in
+                // which any local user can connect and issue privileged
+                // DashboardCmd (BlockUser / BlockIp / ToggleVip). Narrowing the
+                // umask across the bind closes the window outright.
+                //
+                // Note: 0o660 means the TUI must run as the proxy's user or
+                // share its group.
+                let prev_umask = unsafe { libc::umask(0o117) };
+                let bind_result = tokio::net::UnixListener::bind(&socket_path);
+                unsafe {
+                    libc::umask(prev_umask);
+                }
+                let listener = bind_result?;
                 info!("Dashboard listening on {}", socket_path.display());
+
+                // Pin the mode explicitly too, in case the platform did not
+                // apply the umask to the socket inode. Failing open here would
+                // defeat the restriction entirely, so remove the socket and
+                // fail rather than serve privileged commands on it.
+                let perms = std::fs::Permissions::from_mode(0o660);
+                if let Err(e) = std::fs::set_permissions(&socket_path, perms) {
+                    let _ = std::fs::remove_file(&socket_path);
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "failed to restrict permissions on dashboard socket {}: {}",
+                            socket_path.display(),
+                            e
+                        ),
+                    ));
+                }
 
                 let socket_path = socket_path.clone();
                 tokio::spawn(async move {
@@ -120,13 +157,22 @@ impl DashboardServer {
                 Ok(n) => {
                     read_buf.extend_from_slice(&buf[..n]);
                     while read_buf.len() >= 4 {
-                        if let Some(consumed) = consumed_len(&read_buf) {
-                            let payload = read_buf.drain(..consumed).collect::<Vec<_>>();
-                            if let Ok(Some(cmd)) = decode::<DashboardCmd>(&payload) {
-                                Self::apply_cmd(&state, cmd);
+                        match consumed_len(&read_buf) {
+                            Ok(Some(consumed)) => {
+                                let payload = read_buf.drain(..consumed).collect::<Vec<_>>();
+                                if let Ok(Some(cmd)) = decode::<DashboardCmd>(&payload) {
+                                    Self::apply_cmd(&state, cmd);
+                                }
                             }
-                        } else {
-                            break;
+                            // Header is in bounds but the payload is still
+                            // arriving. The advertised length is capped at
+                            // MAX_MESSAGE_LEN, so the buffer stays bounded
+                            // without any further check here.
+                            Ok(None) => break,
+                            Err(e) => {
+                                warn!("Dashboard client sent a bad message header: {e}");
+                                return Ok(());
+                            }
                         }
                     }
                 }
