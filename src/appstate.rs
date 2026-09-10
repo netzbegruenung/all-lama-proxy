@@ -407,6 +407,13 @@ pub struct Task {
     pub headers: HeaderMap,
     pub body: Bytes,
     pub responder: mpsc::Sender<ResponsePart>,
+    /// Model name as spelled by the client, read from the body once at enqueue
+    /// time. The scheduler inspects every queued task on each pass, so it must
+    /// not have to re-parse bodies while holding the queue lock. Aliases are
+    /// still resolved per pass, so a SIGHUP config reload takes effect for
+    /// tasks that are already queued.
+    pub requested_model: Option<String>,
+    /// Real model name this task was routed to, filled in on dispatch.
     pub resolved_model: Option<String>,
 }
 
