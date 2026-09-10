@@ -7,6 +7,7 @@ use axum::{
 use chrono::Utc;
 use futures_util::StreamExt;
 use std::{
+    collections::HashMap,
     collections::VecDeque,
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -19,8 +20,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
 
 use crate::appstate::{
-    AppState, CachedTags, ModelConfig, OpenAIModel, OpenAIModelsList, ResponsePart, Task,
-    model_names_match,
+    AppState, BackendStatus, CachedTags, ModelConfig, OpenAIModel, OpenAIModelsList, ResponsePart,
+    Task, model_names_match,
 };
 use crate::auth::UserRegistry;
 use crate::utils::LockExt;
@@ -500,9 +501,169 @@ async fn handle_model_not_found(task: Task, model_name: String) {
     let _ = task.responder.send(ResponsePart::Chunk(error_body)).await;
 }
 
+/// How a model can be routed at this instant, independent of who is asking.
+enum ModelRoute {
+    /// The model is unknown to the config, or no backend is configured for it.
+    /// Waiting can never help, so tasks for it are failed with the carried name.
+    Unavailable(String),
+    /// Backends are configured but none can take a task right now: offline,
+    /// model not loaded, or at the per-model concurrency cap. Retry next pass.
+    Busy,
+    /// Backends that can accept a task for `model` right now.
+    Ready {
+        model: String,
+        backend_indices: Vec<usize>,
+    },
+}
+
+/// Resolve `requested_model` and collect the backends that could take it now.
+///
+/// The result does not depend on the requesting user, so
+/// [`select_and_prepare_task`] caches it per pass: a user with 50 queued
+/// requests for the same model only pays for this once.
+fn route_model(
+    state: &Arc<AppState>,
+    backends: &[BackendStatus],
+    online_indices: &[usize],
+    requested_model: Option<&str>,
+) -> ModelRoute {
+    let config = state.model_config.read().expect("model_config read");
+
+    // Resolve to the exact model name as spelled in models.yaml (for routing
+    // decisions). Matching tolerates an implicit `:latest` tag on either side,
+    // but the routing key must keep the config spelling because that is what
+    // `BackendStatus::configured_models` and `model_status` are keyed by.
+    let model = match requested_model.and_then(|model| config.resolve_alias(model)) {
+        Some(model) => model,
+        None => {
+            return ModelRoute::Unavailable(requested_model.unwrap_or("unknown").to_string());
+        }
+    };
+    let max_concurrency = config
+        .get_model(&model)
+        .map(|m| m.max_concurrent_requests)
+        .unwrap_or(1);
+    drop(config);
+
+    let eligible: Vec<usize> = online_indices
+        .iter()
+        .copied()
+        .filter(|&i| backends[i].can_serve_model(&model))
+        .collect();
+
+    if eligible.is_empty() {
+        // A backend that is merely offline or temporarily missing the model
+        // will recover, so the task keeps waiting. But if no backend is
+        // configured for the model at all, waiting can never succeed.
+        let configured_anywhere = backends
+            .iter()
+            .any(|b| b.configured_models.iter().any(|m| m == &model));
+
+        return if configured_anywhere {
+            ModelRoute::Busy
+        } else {
+            ModelRoute::Unavailable(model)
+        };
+    }
+
+    let backend_indices: Vec<usize> = eligible
+        .into_iter()
+        .filter(|&i| backends[i].active_models.get(&model).copied().unwrap_or(0) < max_concurrency)
+        .collect();
+
+    if backend_indices.is_empty() {
+        ModelRoute::Busy
+    } else {
+        ModelRoute::Ready {
+            model,
+            backend_indices,
+        }
+    }
+}
+
+/// A queued task the scheduler can act on right now.
+enum TaskPick {
+    Dispatch {
+        queue_idx: usize,
+        model: String,
+        backend_idx: usize,
+    },
+    /// The task's model can never be served - pop it and return 503.
+    Fail {
+        queue_idx: usize,
+        model_name: String,
+    },
+}
+
+/// Find the first task in `queue` that can be acted on right now.
+///
+/// Tasks whose model is only temporarily unroutable (backends offline or at
+/// their concurrency cap) are skipped instead of blocking everything behind
+/// them, so a backlog for one model cannot stall requests for other models.
+/// The scan always runs front to back, so tasks for the *same* model keep
+/// their FIFO order and a skipped task is retried before any later task.
+fn find_dispatchable_task(
+    state: &Arc<AppState>,
+    backends: &[BackendStatus],
+    online_indices: &[usize],
+    queue: &VecDeque<Task>,
+    user_id: &str,
+    routes: &mut HashMap<Option<String>, ModelRoute>,
+) -> Option<TaskPick> {
+    for (queue_idx, task) in queue.iter().enumerate() {
+        let route = routes
+            .entry(task.requested_model.clone())
+            .or_insert_with(|| {
+                route_model(
+                    state,
+                    backends,
+                    online_indices,
+                    task.requested_model.as_deref(),
+                )
+            });
+
+        match route {
+            ModelRoute::Unavailable(model_name) => {
+                return Some(TaskPick::Fail {
+                    queue_idx,
+                    model_name: model_name.clone(),
+                });
+            }
+            ModelRoute::Busy => continue,
+            ModelRoute::Ready {
+                model,
+                backend_indices,
+            } => {
+                // Sticky selection: among backends still under the per-model
+                // concurrency cap, pick the one with the highest rendezvous
+                // weight for this user. This pins a user to a stable backend
+                // (kv-cache reuse) while spreading distinct users across GPUs;
+                // when the preferred backend is capped, the next-ranked one
+                // takes over automatically.
+                let backend_idx = backend_indices.iter().copied().max_by(|&a, &b| {
+                    rendezvous_weight(user_id, &backends[a].url)
+                        .cmp(&rendezvous_weight(user_id, &backends[b].url))
+                        .then(a.cmp(&b))
+                });
+
+                if let Some(backend_idx) = backend_idx {
+                    return Some(TaskPick::Dispatch {
+                        queue_idx,
+                        model: model.clone(),
+                        backend_idx,
+                    });
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn select_and_prepare_task(state: &Arc<AppState>, current_idx: &mut usize) -> SelectionResult {
     let mut queues = state.queues.lock().lock_unwrap("queues");
     let mut backends = state.backends.lock().lock_unwrap("backends");
+    let is_debug = state.debug;
 
     // 1. Find all available online backends (per-model concurrency limits apply below)
     let online_indices: Vec<usize> = backends
@@ -516,10 +677,7 @@ fn select_and_prepare_task(state: &Arc<AppState>, current_idx: &mut usize) -> Se
         return SelectionResult::Wait;
     }
 
-    let mut target_user = None;
-    let vip_list = state.vip_user.lock().lock_unwrap("vip_user").clone();
-    let mut counter = state.global_counter.lock().lock_unwrap("global_counter");
-
+    // 2. Users with something queued, fewest requests processed first
     let mut active_users: Vec<String> = queues
         .iter()
         .filter(|(_, q)| !q.is_empty())
@@ -530,230 +688,139 @@ fn select_and_prepare_task(state: &Arc<AppState>, current_idx: &mut usize) -> Se
         return SelectionResult::Wait;
     }
 
-    active_users.sort_by(|a, b| {
-        let a_total = state
+    {
+        let processed = state
             .processed_counts
             .lock()
-            .lock_unwrap("processed_counts")
-            .get(a)
-            .cloned()
-            .unwrap_or(0);
-        let b_total = state
-            .processed_counts
-            .lock()
-            .lock_unwrap("processed_counts")
-            .get(b)
-            .cloned()
-            .unwrap_or(0);
-        a_total.cmp(&b_total).then_with(|| a.cmp(b))
-    });
+            .lock_unwrap("processed_counts");
+        active_users.sort_by(|a, b| {
+            let a_total = processed.get(a).copied().unwrap_or(0);
+            let b_total = processed.get(b).copied().unwrap_or(0);
+            a_total.cmp(&b_total).then_with(|| a.cmp(b))
+        });
+    }
 
-    // Priority: VIP users first (in order), then round-robin
-    for vip_user in &vip_list {
-        if active_users.contains(vip_user) {
-            target_user = Some(vip_user.clone());
-            break;
+    // 3. Candidate order: VIP users first (in config order), then the rest
+    //    round-robin from `current_idx`.
+    let vip_list = state.vip_user.lock().lock_unwrap("vip_user").clone();
+    let mut candidates: Vec<usize> = Vec::with_capacity(active_users.len());
+    for vip in &vip_list {
+        if let Some(i) = active_users.iter().position(|u| u == vip) {
+            if !candidates.contains(&i) {
+                candidates.push(i);
+            }
+        }
+    }
+    let start = *current_idx % active_users.len();
+    for offset in 0..active_users.len() {
+        let i = (start + offset) % active_users.len();
+        if !candidates.contains(&i) {
+            candidates.push(i);
         }
     }
 
-    if target_user.is_none() {
-        if *current_idx >= active_users.len() {
-            *current_idx = 0;
+    // 4. Try every candidate, not just the first one: a user whose next
+    //    request is blocked on a saturated model must not stall the requests
+    //    that other users have for idle models.
+    let mut routes: HashMap<Option<String>, ModelRoute> = HashMap::new();
+
+    for i in candidates {
+        let user_id = active_users[i].clone();
+        let queue = match queues.get(&user_id) {
+            Some(q) => q,
+            None => continue,
+        };
+
+        let pick = match find_dispatchable_task(
+            state,
+            &backends,
+            &online_indices,
+            queue,
+            &user_id,
+            &mut routes,
+        ) {
+            Some(pick) => pick,
+            None => continue,
+        };
+
+        // Advance the round-robin cursor past the user we serve. VIPs are
+        // always tried first, so serving one must not move the cursor.
+        if !vip_list.contains(&user_id) {
+            *current_idx = i + 1;
         }
-        target_user = Some(active_users[*current_idx].clone());
-        *current_idx += 1;
-    }
 
-    let user_id = match target_user {
-        Some(u) => u,
-        None => return SelectionResult::Wait,
-    };
+        let queue_idx = match &pick {
+            TaskPick::Dispatch { queue_idx, .. } | TaskPick::Fail { queue_idx, .. } => *queue_idx,
+        };
+        let mut task = match queues.get_mut(&user_id).and_then(|q| q.remove(queue_idx)) {
+            Some(task) => task,
+            None => {
+                warn!("User {} disappeared from queues before pop", user_id);
+                return SelectionResult::Wait;
+            }
+        };
+        *state.global_counter.lock().lock_unwrap("global_counter") += 1;
 
-    // Peek at the task to get the model BEFORE popping
-    let task_body = match queues.get(&user_id).and_then(|q| q.front()) {
-        Some(task) => task.body.clone(),
-        None => {
-            warn!("User {} disappeared from queues after selection", user_id);
-            return SelectionResult::Wait;
-        }
-    };
-
-    let is_debug = state.debug;
-    let config = state.model_config.read().expect("model_config read");
-
-    // Peek at the original requested model name
-    let requested_model = peek_model_from_body(&task_body);
-
-    // Resolve to the exact model name as spelled in models.yaml (for routing
-    // decisions). Matching tolerates an implicit `:latest` tag on either side,
-    // but the routing key must keep the config spelling because that is what
-    // `BackendStatus::configured_models` and `model_status` are keyed by.
-    let resolved_model = requested_model
-        .as_deref()
-        .and_then(|model| config.resolve_alias(model));
-
-    drop(config);
-
-    match resolved_model {
-        Some(model) => {
-            // Filter backends: can serve this model
-            let eligible: Vec<usize> = online_indices
-                .iter()
-                .cloned()
-                .filter(|&i| backends[i].can_serve_model(&model))
-                .collect();
-
-            if eligible.is_empty() {
-                // Nothing online can serve the model right now. A backend that is
-                // merely offline or temporarily missing the model will recover, so
-                // wait without popping. But if no backend is configured for the
-                // model at all, waiting can never succeed and the task would block
-                // the head of this user's queue forever - fail it instead.
-                let configured_anywhere = backends
-                    .iter()
-                    .any(|b| b.configured_models.iter().any(|m| m == &model));
-
-                if !configured_anywhere {
-                    let task = match queues.get_mut(&user_id).and_then(|q| q.pop_front()) {
-                        Some(t) => t,
-                        None => {
-                            warn!("User {} disappeared from queues", user_id);
-                            return SelectionResult::Wait;
-                        }
-                    };
-                    *counter += 1;
-                    return SelectionResult::ModelNotFound(task, model);
-                }
-
-                // No eligible backend - wait, do NOT pop the task
+        match pick {
+            TaskPick::Fail { model_name, .. } => {
                 if is_debug {
                     debug!(
-                        "No backend can serve model '{}' for user {}",
-                        model, user_id
+                        "No backend is configured for model '{}' (user {})",
+                        model_name, user_id
                     );
                 }
-                SelectionResult::Wait
-            } else {
-                // Get per-model concurrency limit from config
-                let config = state.model_config.read().expect("model_config read");
-                let max_concurrency = config
-                    .get_model(&model)
-                    .map(|m| m.max_concurrent_requests)
-                    .unwrap_or(1);
-                drop(config);
-
-                // Helper to get per-model count for this specific model
-                let get_model_count = |backend_idx: usize| -> usize {
-                    backends[backend_idx]
-                        .active_models
-                        .get(&model)
-                        .copied()
-                        .unwrap_or(0)
-                };
-
-                // Sticky selection: among backends still under the per-model
-                // concurrency cap, pick the one with the highest rendezvous
-                // weight for this user. This pins a user to a stable backend
-                // (kv-cache reuse) while spreading distinct users across GPUs;
-                // when the preferred backend is capped, the next-ranked one
-                // takes over automatically.
-                let selected_backend_idx = eligible
-                    .iter()
-                    .copied()
-                    .filter(|&i| get_model_count(i) < max_concurrency)
-                    .max_by(|&a, &b| {
-                        rendezvous_weight(&user_id, &backends[a].url)
-                            .cmp(&rendezvous_weight(&user_id, &backends[b].url))
-                            .then(a.cmp(&b))
-                    });
-
-                let selected_backend_idx = match selected_backend_idx {
-                    Some(i) => i,
-                    None => {
-                        // All backends at max concurrency - wait, do NOT pop the task
-                        if is_debug {
-                            debug!(
-                                "All backends at max concurrency ({}) for model '{}', user {} waiting",
-                                max_concurrency, model, user_id
-                            );
-                        }
-                        return SelectionResult::Wait;
-                    }
-                };
-
-                // NOW pop the task (backend is guaranteed available)
-                let mut task = match queues.get_mut(&user_id).and_then(|q| q.pop_front()) {
-                    Some(t) => t,
-                    None => {
-                        warn!("User {} disappeared from queues before pop", user_id);
-                        return SelectionResult::Wait;
-                    }
-                };
-                *counter += 1;
-
+                return SelectionResult::ModelNotFound(task, model_name);
+            }
+            TaskPick::Dispatch {
+                model, backend_idx, ..
+            } => {
                 // Resolve alias in body (mutate the body)
                 let config = state.model_config.read().expect("model_config read");
                 let resolved_model_name =
                     extract_and_resolve_model(&mut task.body, &task.path, &config, is_debug);
+                drop(config);
 
                 // Store resolved model in task and log if alias was used
-                if let Some(ref resolved) = resolved_model_name {
-                    task.resolved_model = Some(resolved.clone());
-
+                if let Some(resolved) = resolved_model_name {
                     // Log alias rewrite if different from requested
                     // (a tag-only difference like `foo` -> `foo:latest` is not a rewrite)
-                    let is_alias_rewrite = requested_model
+                    let is_alias_rewrite = task
+                        .requested_model
                         .as_ref()
-                        .is_some_and(|m| !model_names_match(m, resolved));
+                        .is_some_and(|m| !model_names_match(m, &resolved));
 
                     if is_alias_rewrite {
                         info!(
                             "Mapped requested model {} to {} for user {}",
-                            requested_model.as_deref().unwrap_or("unknown"),
+                            task.requested_model.as_deref().unwrap_or("unknown"),
                             resolved,
                             user_id
                         );
                     }
+
+                    task.resolved_model = Some(resolved);
                 }
 
                 if is_debug {
                     debug!(
                         "Selected backend {} (idx {}) for user {}, model {}",
-                        backends[selected_backend_idx].url, selected_backend_idx, user_id, model
+                        backends[backend_idx].url, backend_idx, user_id, model
                     );
                 }
 
-                backends[selected_backend_idx].active_requests += 1;
-                *backends[selected_backend_idx]
+                backends[backend_idx].active_requests += 1;
+                *backends[backend_idx]
                     .active_models
-                    .entry(model.clone())
+                    .entry(model)
                     .or_insert(0) += 1;
-                SelectionResult::Dispatch(
-                    user_id,
-                    task,
-                    selected_backend_idx,
-                    backends[selected_backend_idx].url.clone(),
-                )
+                let backend_url = backends[backend_idx].url.clone();
+                return SelectionResult::Dispatch(user_id, task, backend_idx, backend_url);
             }
-        }
-        None => {
-            // Model not in config - pop and fail
-            let task = match queues.get_mut(&user_id).and_then(|q| q.pop_front()) {
-                Some(t) => t,
-                None => {
-                    warn!("User {} disappeared from queues", user_id);
-                    return SelectionResult::Wait;
-                }
-            };
-            *counter += 1;
-
-            if is_debug {
-                debug!("Model not in config for user {}", user_id);
-            }
-
-            SelectionResult::ModelNotFound(task, requested_model.unwrap_or("unknown".to_string()))
         }
     }
+
+    // Nothing anywhere can run: wait for a backend to free up or a new task.
+    SelectionResult::Wait
 }
 
 pub async fn run_worker(state: Arc<AppState>) {
@@ -849,6 +916,7 @@ pub async fn proxy_handler(
         method,
         headers: task_headers,
         responder: tx,
+        requested_model: peek_model_from_body(&body),
         body,
         resolved_model: None,
     };
@@ -1120,6 +1188,47 @@ mod tests {
         assert_eq!(sent, "qwen3", "unknown model body must stay untouched");
     }
 
+    /// Queue a chat request for `model` and hand back the receiver, which the
+    /// caller must keep alive for as long as the task stays queued.
+    fn queue_task(
+        state: &Arc<AppState>,
+        user: &str,
+        model: &str,
+    ) -> mpsc::Receiver<crate::appstate::ResponsePart> {
+        let (tx, rx) = mpsc::channel(32);
+        let body = Bytes::from(format!(r#"{{"model":"{}"}}"#, model));
+        state
+            .queues
+            .lock()
+            .lock_unwrap("queues")
+            .entry(user.to_string())
+            .or_insert_with(VecDeque::new)
+            .push_back(Task {
+                method: Method::POST,
+                path: "/api/chat".to_string(),
+                headers: HeaderMap::new(),
+                requested_model: peek_model_from_body(&body),
+                body,
+                responder: tx,
+                resolved_model: None,
+            });
+        rx
+    }
+
+    /// A backend serving `busy:1b` (saturated at its cap of 1) and `idle:1b`.
+    fn saturated_backend() -> BackendStatus {
+        let mut backend = test_backend(&["busy:1b", "idle:1b"]);
+        backend.active_models.insert("busy:1b".to_string(), 1);
+        backend.active_requests = 1;
+        backend
+    }
+
+    fn two_model_config() -> ModelConfig {
+        ModelConfig {
+            models: vec![parsed_model("busy:1b", &[]), parsed_model("idle:1b", &[])],
+        }
+    }
+
     #[tokio::test]
     async fn test_model_without_any_backend_is_failed_not_queued() {
         // A task that no backend is configured for must be popped and 503'd,
@@ -1134,21 +1243,7 @@ mod tests {
             .lock_unwrap("backends")
             .push(test_backend(&["other:1b"]));
 
-        let (tx, _rx) = mpsc::channel(32);
-        state
-            .queues
-            .lock()
-            .lock_unwrap("queues")
-            .entry("alice".to_string())
-            .or_insert_with(VecDeque::new)
-            .push_back(Task {
-                method: Method::POST,
-                path: "/api/chat".to_string(),
-                headers: HeaderMap::new(),
-                body: Bytes::from(r#"{"model":"ghost:1b"}"#),
-                responder: tx,
-                resolved_model: None,
-            });
+        let _rx = queue_task(&state, "alice", "ghost:1b");
 
         let mut idx = 0;
         match select_and_prepare_task(&state, &mut idx) {
@@ -1159,6 +1254,150 @@ mod tests {
             state.queues.lock().lock_unwrap("queues")["alice"].is_empty(),
             "task must be removed from the queue"
         );
+    }
+
+    #[tokio::test]
+    async fn test_busy_model_does_not_block_other_users() {
+        // Regression: a backlog on one model used to put the single worker to
+        // sleep, so nobody else got served even on completely idle models.
+        let state = create_test_state();
+        *state.model_config.write().unwrap() = two_model_config();
+        state
+            .backends
+            .lock()
+            .lock_unwrap("backends")
+            .push(saturated_backend());
+
+        // alice sorts first (equal processed counts, alphabetical), so the old
+        // scheduler picked her blocked request and stopped there.
+        let _alice = queue_task(&state, "alice", "busy:1b");
+        let _bob = queue_task(&state, "bob", "idle:1b");
+
+        let mut idx = 0;
+        match select_and_prepare_task(&state, &mut idx) {
+            SelectionResult::Dispatch(user, task, _, _) => {
+                assert_eq!(user, "bob");
+                assert_eq!(task.resolved_model.as_deref(), Some("idle:1b"));
+            }
+            _ => panic!("bob's request for an idle model must be dispatched"),
+        }
+
+        // alice keeps her place in line until busy:1b frees up.
+        let queues = state.queues.lock().lock_unwrap("queues");
+        assert_eq!(queues["alice"].len(), 1);
+        assert!(queues["bob"].is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_busy_model_does_not_block_later_task_of_same_user() {
+        // Within one user's queue a request for a saturated model must not
+        // hold back their later requests for other models.
+        let state = create_test_state();
+        *state.model_config.write().unwrap() = two_model_config();
+        state
+            .backends
+            .lock()
+            .lock_unwrap("backends")
+            .push(saturated_backend());
+
+        let _blocked = queue_task(&state, "alice", "busy:1b");
+        let _runnable = queue_task(&state, "alice", "idle:1b");
+
+        let mut idx = 0;
+        match select_and_prepare_task(&state, &mut idx) {
+            SelectionResult::Dispatch(user, task, _, _) => {
+                assert_eq!(user, "alice");
+                assert_eq!(task.resolved_model.as_deref(), Some("idle:1b"));
+            }
+            _ => panic!("the second queued request must be dispatched"),
+        }
+
+        // The skipped request stays at the head, so it runs first once free.
+        let queues = state.queues.lock().lock_unwrap("queues");
+        assert_eq!(queues["alice"].len(), 1);
+        assert_eq!(
+            queues["alice"][0].requested_model.as_deref(),
+            Some("busy:1b")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blocked_vip_does_not_stall_other_users() {
+        // VIPs are tried first, but a VIP waiting on a saturated model must
+        // not starve everyone else indefinitely.
+        let state = create_test_state();
+        *state.model_config.write().unwrap() = two_model_config();
+        state
+            .backends
+            .lock()
+            .lock_unwrap("backends")
+            .push(saturated_backend());
+        state
+            .vip_user
+            .lock()
+            .lock_unwrap("vip_user")
+            .push("vip".to_string());
+
+        let _vip = queue_task(&state, "vip", "busy:1b");
+        let _bob = queue_task(&state, "bob", "idle:1b");
+
+        let mut idx = 0;
+        match select_and_prepare_task(&state, &mut idx) {
+            SelectionResult::Dispatch(user, _, _, _) => assert_eq!(user, "bob"),
+            _ => panic!("bob must be dispatched while the VIP waits"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_vip_user_is_served_first() {
+        // The fallback scan must not weaken VIP priority when both are runnable.
+        let state = create_test_state();
+        *state.model_config.write().unwrap() = two_model_config();
+        state
+            .backends
+            .lock()
+            .lock_unwrap("backends")
+            .push(test_backend(&["busy:1b", "idle:1b"]));
+        state
+            .vip_user
+            .lock()
+            .lock_unwrap("vip_user")
+            .push("zoe".to_string());
+
+        let _alice = queue_task(&state, "alice", "idle:1b");
+        let _zoe = queue_task(&state, "zoe", "busy:1b");
+
+        let mut idx = 0;
+        match select_and_prepare_task(&state, &mut idx) {
+            SelectionResult::Dispatch(user, _, _, _) => assert_eq!(user, "zoe"),
+            _ => panic!("the VIP must be dispatched first"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_all_models_busy_waits() {
+        // With nothing runnable the worker must still park instead of spinning.
+        let state = create_test_state();
+        *state.model_config.write().unwrap() = two_model_config();
+        state
+            .backends
+            .lock()
+            .lock_unwrap("backends")
+            .push(saturated_backend());
+
+        let _alice = queue_task(&state, "alice", "busy:1b");
+        let _bob = queue_task(&state, "bob", "busy:1b");
+
+        let mut idx = 0;
+        assert!(
+            matches!(
+                select_and_prepare_task(&state, &mut idx),
+                SelectionResult::Wait
+            ),
+            "expected Wait when every model is at capacity"
+        );
+        assert_eq!(state.queues.lock().lock_unwrap("queues")["alice"].len(), 1);
+        assert_eq!(state.queues.lock().lock_unwrap("queues")["bob"].len(), 1);
     }
 
     #[test]
